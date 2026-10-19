@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+# Credentials live in ~/.config/omarchy/ctrader, never in the plugin dir,
+# but keep a stray copy out of the repo all the same.
+config.json
+*.token
+.env

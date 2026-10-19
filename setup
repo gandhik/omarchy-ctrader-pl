@@ -1,0 +1,94 @@
+#!/bin/bash
+# Wire up the poller for this machine after `omarchy plugin add`.
+#
+#   ./setup                      put the commands on PATH, install the service,
+#                                authorise your own cTrader account, start polling
+#   ./setup --environment live   same, authorising against a live account
+#   ./setup --uninstall          stop the service and remove the links
+#   ./setup --uninstall --purge  ...and delete your tokens and P/L history
+#
+# Safe to re-run. Your credentials never live in the plugin folder: the auth
+# wizard writes them to ~/.config/omarchy/ctrader/config.json (mode 0600).
+set -euo pipefail
+
+id=ctrader-pl
+service=omarchy-ctrader.service
+plugin_dir="$HOME/.config/omarchy/plugins/$id"
+config_dir="$HOME/.config/omarchy/ctrader"
+state_dir="$HOME/.local/state/omarchy/ctrader"
+bin_dir="$HOME/.local/bin"
+unit_dir="$HOME/.config/systemd/user"
+commands=(ctrader-auth ctrader-poll)
+
+here=$(cd "$(dirname "$0")" && pwd -P)
+
+uninstall=0 purge=0 auth_args=()
+while (( $# > 0 )); do
+  case "$1" in
+  --uninstall) uninstall=1 ;;
+  --purge) purge=1 ;;
+  -h | --help) sed -n '2,11s/^# \{0,1\}//p' "$0"; exit 0 ;;
+  *) auth_args+=("$1") ;;
+  esac
+  shift
+done
+
+if (( uninstall )); then
+  systemctl --user disable --now "$service" 2>/dev/null || true
+  rm -f "$unit_dir/$service"
+  systemctl --user daemon-reload
+  for c in "${commands[@]}"; do
+    [[ -L $bin_dir/$c ]] && rm -f "$bin_dir/$c"
+  done
+  if (( purge )); then
+    rm -rf "$config_dir" "$state_dir"
+    echo "Removed the service, commands, tokens and history."
+  else
+    echo "Removed the service and commands. Tokens and history kept in:"
+    echo "  $config_dir"
+    echo "  $state_dir"
+  fi
+  echo "Remove the widget itself with: omarchy plugin remove $id"
+  exit 0
+fi
+
+# The systemd unit points at the installed plugin path, so run from there.
+if [[ $here != "$(cd "$plugin_dir" 2>/dev/null && pwd -P)" ]]; then
+  cat >&2 <<EOF
+setup: this checkout is at $here
+       but the plugin must be installed at $plugin_dir.
+       Install it with:  omarchy plugin add <repo-url> --enable
+       then run:         $plugin_dir/setup
+EOF
+  exit 1
+fi
+
+command -v python3 >/dev/null || { echo "setup: python3 is required" >&2; exit 1; }
+
+# The service sandbox only allows writes to these, and refuses to start if
+# they are missing.
+mkdir -p "$bin_dir" "$unit_dir" "$state_dir" "$config_dir"
+chmod 700 "$config_dir"
+
+for c in "${commands[@]}"; do
+  ln -sfn "$plugin_dir/bin/$c" "$bin_dir/$c"
+done
+ln -sfn "$plugin_dir/systemd/$service" "$unit_dir/$service"
+systemctl --user daemon-reload
+echo "Linked ${commands[*]} into $bin_dir and $service into $unit_dir"
+
+if [[ ! -f $config_dir/config.json || ${#auth_args[@]} -gt 0 ]]; then
+  echo
+  echo "Next: authorise your own cTrader account. You need an Open API app from"
+  echo "https://openapi.ctrader.com/ with redirect URI http://localhost:7331/callback"
+  echo
+  "$plugin_dir/bin/ctrader-auth" "${auth_args[@]}"
+fi
+
+systemctl --user enable "$service"
+systemctl --user restart "$service"
+echo
+echo "Poller running. Check it with: systemctl --user status $service"
+if [[ ":$PATH:" != *":$bin_dir:"* ]]; then
+  echo "Note: $bin_dir is not on your PATH, so call the commands by full path."
+fi

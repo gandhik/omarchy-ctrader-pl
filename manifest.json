@@ -1,0 +1,73 @@
+{
+  "schemaVersion": 1,
+  "id": "ctrader-pl",
+  "name": "cTrader P/L",
+  "version": "1.3.0",
+  "author": "omarchy-ctrader-pl contributors",
+  "description": "Live cTrader unrealised P/L in the bar, with a portfolio popup listing every open position and a P&L histogram over time",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "cTrader P/L",
+    "description": "Unrealised P/L pill; click for the portfolio and the P&L history",
+    "category": "Info",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "showCurrency": true,
+      "showAccountRow": true,
+      "profitColor": "#4fb286",
+      "lossColor": "",
+      "staleAfterSeconds": 60,
+      "chartOpenByDefault": false,
+      "chartRange": "6h",
+      "tradingViewExchange": ""
+    },
+    "schema": [
+      {
+        "key": "showCurrency",
+        "type": "bool",
+        "label": "Show currency code in the bar"
+      },
+      {
+        "key": "showAccountRow",
+        "type": "bool",
+        "label": "Show balance/equity row in the popup"
+      },
+      {
+        "key": "profitColor",
+        "type": "string",
+        "label": "Colour for profit"
+      },
+      {
+        "key": "lossColor",
+        "type": "string",
+        "label": "Colour for loss (blank = theme urgent)"
+      },
+      {
+        "key": "staleAfterSeconds",
+        "type": "int",
+        "label": "Dim the pill after this many seconds without an update"
+      },
+      {
+        "key": "chartOpenByDefault",
+        "type": "bool",
+        "label": "Open the P&L histogram automatically"
+      },
+      {
+        "key": "chartRange",
+        "type": "string",
+        "label": "Histogram window to start on (1h, 6h, 24h or 7d)"
+      },
+      {
+        "key": "tradingViewExchange",
+        "type": "string",
+        "label": "TradingView exchange prefix for your broker's symbols (blank = let TradingView choose)"
+      }
+    ]
+  }
+}

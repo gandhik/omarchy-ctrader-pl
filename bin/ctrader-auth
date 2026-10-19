@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+"""One-time setup: authorise this machine against your cTrader account.
+
+Walks through the cTrader Open API OAuth flow, picks which trading account to
+track, and writes ~/.config/omarchy/ctrader/config.json (mode 0600).
+
+Run it again any time to re-authorise or switch accounts.
+"""
+
+import argparse
+import http.server
+import json
+import os
+import sys
+import threading
+import urllib.parse
+import webbrowser
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ctrader  # noqa: E402
+
+DEFAULT_REDIRECT = "http://localhost:7331/callback"
+
+
+def prompt(label, default=None, secret=False):
+    suffix = f" [{default}]" if default else ""
+    while True:
+        value = input(f"{label}{suffix}: ").strip()
+        if not value and default:
+            return default
+        if value:
+            return value
+        print("  (required)")
+
+
+class _CallbackHandler(http.server.BaseHTTPRequestHandler):
+    code = None
+
+    def do_GET(self):
+        query = urllib.parse.urlparse(self.path).query
+        params = urllib.parse.parse_qs(query)
+        _CallbackHandler.code = (params.get("code") or [None])[0]
+        body = (b"<html><body style='font-family:sans-serif;padding:3rem'>"
+                b"<h2>Authorised.</h2><p>You can close this tab and return to "
+                b"the terminal.</p></body></html>")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass  # keep the wizard's output clean
+
+
+def capture_code_via_server(redirect_uri, timeout=300):
+    """Serve the redirect URI just long enough to catch the ?code= handoff."""
+    parsed = urllib.parse.urlparse(redirect_uri)
+    if parsed.hostname not in ("localhost", "127.0.0.1"):
+        return None
+    port = parsed.port or 80
+    try:
+        server = http.server.HTTPServer(("127.0.0.1", port), _CallbackHandler)
+    except OSError as exc:
+        print(f"  (cannot listen on {redirect_uri}: {exc}; falling back to paste)")
+        return None
+    server.timeout = timeout
+    thread = threading.Thread(target=server.handle_request, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    server.server_close()
+    return _CallbackHandler.code
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--environment", choices=["demo", "live"],
+                        help="which cTrader environment to track")
+    parser.add_argument("--no-browser", action="store_true",
+                        help="print the auth URL instead of opening a browser")
+    args = parser.parse_args()
+
+    config = {}
+    if os.path.exists(ctrader.CONFIG_PATH):
+        try:
+            config = ctrader.load_config()
+        except (OSError, ValueError):
+            config = {}
+
+    print("cTrader Open API setup")
+    print("-" * 60)
+    print("If you have not registered an application yet, do that first at")
+    print("  https://openapi.ctrader.com/  ->  Applications  ->  Add application")
+    print(f"Set its redirect URI to exactly:  {DEFAULT_REDIRECT}")
+    print("-" * 60)
+
+    client_id = prompt("Client ID", config.get("clientId"))
+    client_secret = prompt("Client secret", config.get("clientSecret"))
+    redirect_uri = prompt("Redirect URI", config.get("redirectUri") or DEFAULT_REDIRECT)
+    environment = args.environment or prompt("Environment (demo/live)",
+                                             config.get("environment") or "demo")
+    if environment not in ("demo", "live"):
+        sys.exit("Environment must be 'demo' or 'live'.")
+
+    # Scope "accounts" is read-only. This plugin never places or closes trades,
+    # so there is no reason to grant "trading".
+    auth_url = ctrader.authorization_url(client_id, redirect_uri, scope="accounts")
+    print("\nOpen this URL and approve access:\n")
+    print(f"  {auth_url}\n")
+    if not args.no_browser:
+        try:
+            webbrowser.open(auth_url)
+        except Exception:
+            pass
+
+    print("Waiting for the redirect (Ctrl-C to paste the code by hand)...")
+    code = None
+    try:
+        code = capture_code_via_server(redirect_uri)
+    except KeyboardInterrupt:
+        print()
+    if not code:
+        pasted = prompt("\nPaste the full redirect URL (or just the code)")
+        if "code=" in pasted:
+            code = urllib.parse.parse_qs(urllib.parse.urlparse(pasted).query).get("code", [None])[0]
+        else:
+            code = pasted.strip()
+    if not code:
+        sys.exit("No authorization code captured.")
+
+    print("Exchanging the code for tokens...")
+    tokens = ctrader.exchange_code(client_id, client_secret, code, redirect_uri)
+    access_token = tokens["accessToken"]
+    refresh = tokens.get("refreshToken", "")
+
+    print("Fetching your trading accounts...")
+    with ctrader.CTraderClient(environment) as client:
+        client.application_auth(client_id, client_secret)
+        accounts = client.account_list(access_token)
+
+    want_live = environment == "live"
+    matching = [a for a in accounts if bool(a.get("isLive")) == want_live]
+    if not matching:
+        print(f"\nNo {environment} accounts are linked to this token.")
+        if accounts:
+            print("Accounts the token can see:")
+            for a in accounts:
+                kind = "live" if a.get("isLive") else "demo"
+                print(f"  - {a.get('traderLogin')} ({kind}) {a.get('brokerTitleShort', '')}")
+            print("Re-run with the matching --environment.")
+        sys.exit(1)
+
+    if len(matching) == 1:
+        chosen = matching[0]
+        print(f"Using the only {environment} account: {chosen.get('traderLogin')}")
+    else:
+        print(f"\n{environment} accounts:")
+        for i, a in enumerate(matching, 1):
+            print(f"  {i}. login {a.get('traderLogin')}  "
+                  f"{a.get('brokerTitleShort', '')}  (id {a.get('ctidTraderAccountId')})")
+        while True:
+            raw = input(f"Pick one [1-{len(matching)}]: ").strip()
+            if raw.isdigit() and 1 <= int(raw) <= len(matching):
+                chosen = matching[int(raw) - 1]
+                break
+
+    config.update({
+        "environment": environment,
+        "clientId": client_id,
+        "clientSecret": client_secret,
+        "redirectUri": redirect_uri,
+        "accessToken": access_token,
+        "refreshToken": refresh,
+        "accountId": int(chosen["ctidTraderAccountId"]),
+        "traderLogin": chosen.get("traderLogin"),
+        "broker": chosen.get("brokerTitleShort") or "cTrader",
+        "pollSeconds": config.get("pollSeconds", 10),
+    })
+    ctrader.save_config(config)
+    print(f"\nSaved {ctrader.CONFIG_PATH} (mode 0600).")
+    print("\nStart the poller with:")
+    print("  systemctl --user enable --now omarchy-ctrader.service")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except ctrader.CTraderError as exc:
+        sys.exit(f"cTrader API error: {exc}")
+    except KeyboardInterrupt:
+        sys.exit("\nCancelled.")

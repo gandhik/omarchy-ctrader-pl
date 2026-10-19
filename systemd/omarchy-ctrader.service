@@ -1,0 +1,23 @@
+[Unit]
+Description=Omarchy cTrader P/L poller
+Documentation=file://%h/.config/omarchy/plugins/ctrader-pl/README.md
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.config/omarchy/plugins/ctrader-pl/bin/ctrader-poll
+Restart=always
+RestartSec=10
+# Read-only market data: no reason for this to reach anything else.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/omarchy/ctrader
+ReadWritePaths=%h/.config/omarchy/ctrader
+# The plugin dir is read-only under this sandbox; don't try to cache bytecode there.
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+[Install]
+WantedBy=graphical-session.target

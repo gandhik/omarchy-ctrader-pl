@@ -1,0 +1,50 @@
+name: Bug report
+description: Something isn't working
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Redact before posting.** Remove your account ID, client ID, client secret and any tokens.
+        Never paste `~/.config/omarchy/ctrader/config.json`. Report security problems privately (see SECURITY.md).
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+  - type: input
+    id: plugin-version
+    attributes:
+      label: Plugin version
+      description: The `version` field in manifest.json
+    validations:
+      required: true
+  - type: input
+    id: omarchy-version
+    attributes:
+      label: Omarchy version
+      description: Output of `omarchy version`
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Account environment
+      options: [demo, live]
+  - type: input
+    id: broker
+    attributes:
+      label: Broker (optional)
+      description: Helps when symbol names or account data differ between brokers.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs (redacted)
+      description: Output of `ctrader-poll --once --print` and/or `journalctl --user -u omarchy-ctrader.service -n 50`
+      render: text

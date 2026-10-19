@@ -1,0 +1,300 @@
+#!/usr/bin/env python3
+"""Poll a cTrader account and publish a snapshot for the Omarchy bar.
+
+Writes ~/.local/state/omarchy/ctrader/state.json on every tick. The shell
+plugin watches that file; this process is the only thing that talks to the
+broker. Read-only: it never sends an order message.
+"""
+
+import argparse
+import os
+import signal
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ctrader  # noqa: E402
+from ctrader import CTraderError, scale  # noqa: E402
+
+# The proxy hangs up on idle connections; keep well inside that window.
+HEARTBEAT_AFTER = 10.0
+RECONNECT_BACKOFF = (5, 10, 20, 30, 60)
+
+_running = True
+
+
+def _stop(*_args):
+    global _running
+    _running = False
+
+
+# Last successful snapshot, so a dropped connection degrades to "here is the
+# book as of 40s ago" instead of blanking the number the user is watching.
+_last_good = None
+
+
+def publish(status, **fields):
+    global _last_good
+    state = {"status": status, "updatedAt": int(time.time())}
+    state.update(fields)
+    if status == "ok":
+        _last_good = dict(state)
+    elif _last_good is not None:
+        # Carry the stale book forward; the widget dims it on age and the
+        # panel shows the error line above it.
+        for key in ("account", "unrealized", "positions"):
+            state.setdefault(key, _last_good.get(key))
+        state["updatedAt"] = _last_good.get("updatedAt", state["updatedAt"])
+        state["staleSince"] = int(time.time())
+    ctrader.write_state(state)
+    return state
+
+
+def side_of(trade_data):
+    side = trade_data.get("tradeSide")
+    # The JSON encoding sends enums as names, but tolerate the numeric form.
+    if isinstance(side, int):
+        return {1: "BUY", 2: "SELL"}.get(side, "?")
+    return str(side or "?").upper()
+
+
+class Tracker:
+    def __init__(self, config):
+        self.config = config
+        self.account_id = int(config["accountId"])
+        self.client = None
+        self.symbol_names = {}     # symbolId -> "EURUSD"
+        self.symbol_details = {}   # symbolId -> {"lotSize":.., "digits":..}
+        self.currency = config.get("currency") or ""
+        # Reloaded rather than started empty: "force update" in the widget
+        # restarts this unit, so an in-memory-only series would reset every
+        # time the user asked for a refresh.
+        self.history = ctrader.load_history()
+        self._appends_since_trim = 0
+
+    # ----------------------------------------------------------- lifecycle
+    def refresh_access_token(self):
+        refresh = self.config.get("refreshToken")
+        if not refresh:
+            raise CTraderError("NO_REFRESH_TOKEN",
+                               "no refresh token stored; re-run ctrader-auth")
+        tokens = ctrader.refresh_token(self.config["clientId"],
+                                       self.config["clientSecret"], refresh)
+        self.config["accessToken"] = tokens["accessToken"]
+        if tokens.get("refreshToken"):
+            self.config["refreshToken"] = tokens["refreshToken"]
+        ctrader.save_config(self.config)
+        return self.config["accessToken"]
+
+    def connect(self):
+        self.client = ctrader.CTraderClient(self.config.get("environment", "demo")).connect()
+        self.client.application_auth(self.config["clientId"], self.config["clientSecret"])
+        try:
+            self.client.account_auth(self.account_id, self.config["accessToken"])
+        except CTraderError as exc:
+            # An expired access token is the ordinary case after ~30 days.
+            if "TOKEN" not in str(exc.code).upper():
+                raise
+            self.client.account_auth(self.account_id, self.refresh_access_token())
+
+        self.symbol_names = {
+            int(s["symbolId"]): s.get("symbolName") or f"#{s['symbolId']}"
+            for s in self.client.symbols(self.account_id) if s.get("symbolId") is not None
+        }
+        if not self.currency:
+            self.currency = self.resolve_currency()
+
+    def resolve_currency(self):
+        trader = self.client.trader(self.account_id)
+        deposit_asset = trader.get("depositAssetId")
+        if deposit_asset is None:
+            return ""
+        for asset in self.client.assets(self.account_id):
+            if int(asset.get("assetId", -1)) == int(deposit_asset):
+                return asset.get("displayName") or asset.get("name") or ""
+        return ""
+
+    def details_for(self, symbol_ids):
+        """Lot size and price precision, fetched once per symbol and cached."""
+        missing = [s for s in symbol_ids if s not in self.symbol_details]
+        if missing:
+            for sym in self.client.symbol_details(self.account_id, missing):
+                sid = int(sym.get("symbolId", -1))
+                self.symbol_details[sid] = {
+                    "lotSize": int(sym.get("lotSize") or 0),
+                    "digits": int(sym.get("digits") or 5),
+                }
+            for sid in missing:  # do not refetch symbols the server omitted
+                self.symbol_details.setdefault(sid, {"lotSize": 0, "digits": 5})
+        return self.symbol_details
+
+    # ------------------------------------------------------------- history
+    def record(self, net, equity, balance):
+        """Log one sample and refresh the pre-bucketed chart the popup reads."""
+        sample = {"t": int(time.time()), "net": round(net, 2),
+                  "eq": round(equity, 2), "bal": round(balance, 2)}
+        self.history.append(sample)
+        try:
+            ctrader.append_history(sample)
+            self._appends_since_trim += 1
+            # Trimming rewrites the whole log, so it is amortised rather than
+            # run every tick — retention has a day of slack and a few extra
+            # minutes of samples past the edge costs nothing.
+            if self._appends_since_trim >= 360:
+                self.history = ctrader.load_history()
+                ctrader.rewrite_history(self.history)
+                self._appends_since_trim = 0
+            ctrader.write_chart(ctrader.build_chart(self.history, self.currency))
+        except OSError as exc:
+            # A full disk must not take the live P/L pill down with it.
+            print(f"ctrader-poll: history write failed: {exc}", file=sys.stderr)
+
+    # ---------------------------------------------------------------- tick
+    def tick(self):
+        positions = self.client.positions(self.account_id)
+        pnl_rows, pnl_digits = self.client.unrealized_pnl(self.account_id)
+        trader = self.client.trader(self.account_id)
+
+        pnl_by_id = {int(r["positionId"]): r for r in pnl_rows if r.get("positionId") is not None}
+        symbol_ids = {int(p.get("tradeData", {}).get("symbolId", -1)) for p in positions}
+        symbol_ids.discard(-1)
+        details = self.details_for(symbol_ids)
+
+        rows = []
+        net_total = 0.0
+        gross_total = 0.0
+        margin_total = 0.0
+        for pos in positions:
+            trade = pos.get("tradeData", {}) or {}
+            sid = int(trade.get("symbolId", -1))
+            money_digits = pos.get("moneyDigits", 2)
+            detail = details.get(sid, {"lotSize": 0, "digits": 5})
+            volume_cents = float(trade.get("volume") or 0)
+            lot_size = detail["lotSize"]
+            lots = (volume_cents / lot_size) if lot_size else (volume_cents / 1e7)
+
+            pnl_row = pnl_by_id.get(int(pos.get("positionId", -1)), {})
+            net = scale(pnl_row.get("netUnrealizedPnL"), pnl_digits)
+            gross = scale(pnl_row.get("grossUnrealizedPnL"), pnl_digits)
+            used_margin = scale(pos.get("usedMargin"), money_digits)
+
+            net_total += net
+            gross_total += gross
+            margin_total += used_margin
+
+            rows.append({
+                "id": int(pos.get("positionId", 0)),
+                "symbol": self.symbol_names.get(sid, f"#{sid}"),
+                "side": side_of(trade),
+                "lots": round(lots, 4),
+                "volumeUnits": round(volume_cents / 100.0, 2),
+                "openPrice": pos.get("price"),
+                "digits": detail["digits"],
+                "pnl": round(net, 2),
+                "grossPnl": round(gross, 2),
+                "swap": round(scale(pos.get("swap"), money_digits), 2),
+                "commission": round(scale(pos.get("commission"), money_digits), 2),
+                "usedMargin": round(used_margin, 2),
+                "openedAt": trade.get("openTimestamp"),
+            })
+
+        # Biggest movers first, so the panel leads with what matters.
+        rows.sort(key=lambda r: abs(r["pnl"]), reverse=True)
+
+        trader_digits = trader.get("moneyDigits", 2)
+        balance = scale(trader.get("balance"), trader_digits)
+        equity = balance + net_total
+        self.record(net_total, equity, balance)
+
+        return publish(
+            "ok",
+            environment=self.config.get("environment", "demo"),
+            error=None,
+            account={
+                "id": self.account_id,
+                "login": self.config.get("traderLogin"),
+                "broker": self.config.get("broker") or "cTrader",
+                "currency": self.currency,
+                "balance": round(balance, 2),
+                "equity": round(equity, 2),
+                "usedMargin": round(margin_total, 2),
+                "freeMargin": round(equity - margin_total, 2),
+            },
+            unrealized={
+                "net": round(net_total, 2),
+                "gross": round(gross_total, 2),
+                "currency": self.currency,
+                "returnPct": round(net_total / balance * 100.0, 3) if balance else 0.0,
+            },
+            positions=rows,
+        )
+
+
+def run(config, once=False):
+    interval = max(2, int(config.get("pollSeconds", 10)))
+    attempt = 0
+    tracker = Tracker(config)
+
+    while _running:
+        try:
+            publish("connecting", error=None,
+                    environment=config.get("environment", "demo"))
+            tracker.connect()
+            attempt = 0
+            while _running:
+                tracker.tick()
+                if once:
+                    return 0
+                deadline = time.monotonic() + interval
+                while _running and time.monotonic() < deadline:
+                    time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
+                    if tracker.client.seconds_since_send() > HEARTBEAT_AFTER:
+                        tracker.client.heartbeat()
+        except (CTraderError, OSError, TimeoutError, ValueError, KeyError) as exc:
+            message = f"{type(exc).__name__}: {exc}" if not isinstance(exc, CTraderError) else str(exc)
+            publish("error", error=message,
+                    environment=config.get("environment", "demo"))
+            if once:
+                print(message, file=sys.stderr)
+                return 1
+            delay = RECONNECT_BACKOFF[min(attempt, len(RECONNECT_BACKOFF) - 1)]
+            attempt += 1
+            print(f"ctrader-poll: {message} — retrying in {delay}s", file=sys.stderr)
+            for _ in range(delay * 2):
+                if not _running:
+                    break
+                time.sleep(0.5)
+        finally:
+            if tracker.client:
+                tracker.client.close()
+                tracker.client = None
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--once", action="store_true",
+                        help="fetch a single snapshot and exit (useful for testing)")
+    parser.add_argument("--print", dest="show", action="store_true",
+                        help="also print the snapshot to stdout")
+    args = parser.parse_args()
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+
+    if not os.path.exists(ctrader.CONFIG_PATH):
+        publish("unconfigured",
+                error="Run ctrader-auth to connect your cTrader account.")
+        sys.exit("No config. Run: ctrader-auth")
+
+    config = ctrader.load_config()
+    code = run(config, once=args.once)
+    if args.show:
+        with open(ctrader.STATE_PATH, encoding="utf-8") as fh:
+            print(fh.read())
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)
