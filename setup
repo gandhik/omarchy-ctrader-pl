@@ -68,7 +68,9 @@ command -v python3 >/dev/null || { echo "setup: python3 is required" >&2; exit 1
 # The service sandbox only allows writes to these, and refuses to start if
 # they are missing.
 mkdir -p "$bin_dir" "$unit_dir" "$state_dir" "$config_dir"
-chmod 700 "$config_dir"
+chmod 700 "$config_dir" "$state_dir"
+# Repair files written by earlier versions with default permissions.
+find "$state_dir" -maxdepth 1 -type f -exec chmod 600 {} +
 
 for c in "${commands[@]}"; do
   ln -sfn "$plugin_dir/bin/$c" "$bin_dir/$c"

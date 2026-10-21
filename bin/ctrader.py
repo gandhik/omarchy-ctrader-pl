@@ -278,26 +278,46 @@ CONFIG_PATH = os.path.expanduser("~/.config/omarchy/ctrader/config.json")
 STATE_PATH = os.path.expanduser("~/.local/state/omarchy/ctrader/state.json")
 
 
+def ensure_private_dir(path):
+    """Create `path` if needed and force owner-only access, repairing old modes."""
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    os.chmod(path, 0o700)
+
+
+def open_private(path, flags):
+    """Open `path` for text writing, owner-only from the first byte.
+
+    Created with 0600 so there is no window where another user could read it,
+    and fchmod'd so a file left behind with looser permissions is repaired.
+    """
+    fd = os.open(path, flags | os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        return os.fdopen(fd, "w", encoding="utf-8")
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def load_config(path=CONFIG_PATH):
     with open(path, "r", encoding="utf-8") as fh:
         return json.load(fh)
 
 
 def save_config(config, path=CONFIG_PATH):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    ensure_private_dir(os.path.dirname(path))
     tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
+    with open_private(tmp, os.O_TRUNC) as fh:
         json.dump(config, fh, indent=2)
         fh.write("\n")
-    os.chmod(tmp, 0o600)
     os.replace(tmp, path)
 
 
 def write_state(state, path=STATE_PATH):
     """Atomic replace so the shell's FileView never reads a half-written file."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    ensure_private_dir(os.path.dirname(path))
     tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
+    with open_private(tmp, os.O_TRUNC) as fh:
         json.dump(state, fh, indent=2)
         fh.write("\n")
     os.replace(tmp, path)
@@ -331,8 +351,8 @@ CHART_RANGES = (
 
 def append_history(sample, path=HISTORY_PATH):
     """One line per tick. Append-only so a crash costs at most a torn line."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "a", encoding="utf-8") as fh:
+    ensure_private_dir(os.path.dirname(path))
+    with open_private(path, os.O_APPEND) as fh:
         fh.write(json.dumps(sample, separators=(",", ":")) + "\n")
 
 
@@ -363,9 +383,9 @@ def load_history(path=HISTORY_PATH, retention=HISTORY_RETENTION_SECONDS, now=Non
 
 def rewrite_history(samples, path=HISTORY_PATH):
     """Atomically replace the log with `samples` — how retention is applied."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    ensure_private_dir(os.path.dirname(path))
     tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
+    with open_private(tmp, os.O_TRUNC) as fh:
         for sample in samples:
             fh.write(json.dumps(sample, separators=(",", ":")) + "\n")
     os.replace(tmp, path)
@@ -436,9 +456,9 @@ def build_chart(samples, currency="", now=None):
 
 def write_chart(chart, path=CHART_PATH):
     """Atomic replace so the shell's FileView never reads a half-written file."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    ensure_private_dir(os.path.dirname(path))
     tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
+    with open_private(tmp, os.O_TRUNC) as fh:
         json.dump(chart, fh, separators=(",", ":"))
         fh.write("\n")
     os.replace(tmp, path)
