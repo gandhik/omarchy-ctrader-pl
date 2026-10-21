@@ -264,13 +264,16 @@ def refresh_token(client_id, client_secret, refresh):
     })
 
 
-def authorization_url(client_id, redirect_uri, scope="accounts"):
-    return AUTH_URL + "?" + urllib.parse.urlencode({
+def authorization_url(client_id, redirect_uri, scope="accounts", state=None):
+    params = {
         "client_id": client_id,
         "redirect_uri": redirect_uri,
         "scope": scope,
         "product": "web",
-    })
+    }
+    if state:
+        params["state"] = state
+    return AUTH_URL + "?" + urllib.parse.urlencode(params)
 
 
 # ------------------------------------------------------------------ config
