@@ -13,6 +13,10 @@ front-end shows.
 It is strictly read-only: the OAuth scope requested is `accounts`, not
 `trading`, so it cannot place, modify or close an order even if asked to.
 
+Listed in the [Omarchy plugin marketplace](https://plugins.omarchy.org/plugin.html?id=ctrader-pl).
+
+![The cTrader P/L popup](preview.png)
+
 ## Requirements
 
 - [Omarchy](https://omarchy.org) with the Omarchy shell
